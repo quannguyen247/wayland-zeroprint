@@ -1,45 +1,82 @@
 #!/usr/bin/env python3
 """
 wayland-zeroprint: Zero-Drop Hardware PrintScreen Daemon for Linux Wayland.
-Captures lossless pixel-by-pixel screenshots directly into the Wayland clipboard
-by reading hardware interrupts via the Linux evdev subsystem, bypassing compositor grab locks.
+
+Intercepts physical PrintScreen interrupts from Linux evdev input nodes,
+bypassing Wayland compositor grab locks and popup dismissal, capturing
+lossless frames directly to shared memory (/dev/shm) and streaming them
+to the Wayland clipboard via wl-copy.
 """
 
 import glob
 import os
 import select
+import shutil
+import signal
 import struct
 import subprocess
-import time
-import signal
 import sys
+import time
 
-# Linux Input Event Constants
+# Linux input event constants (linux/input-event-codes.h)
 EV_KEY = 1
 KEY_SYSRQ = 99
 KEY_PRINT = 210
 
 # 64-bit Linux struct input_event layout:
-# tv_sec (8B), tv_usec (8B), type (2B), code (2B), value (4B) = 24 Bytes
+# timeval (16 bytes: tv_sec 8B, tv_usec 8B), type (2B), code (2B), value (4B) = 24 bytes
 EVENT_FORMAT = "@qqHHi"
 EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
 
-# In-memory RAM buffer (tmpfs) for zero disk I/O
+# Shared memory RAM buffer (tmpfs) to eliminate disk I/O latency
 SHM_BUFFER = "/dev/shm/wayland_zeroprint.png"
+
+
+def detect_capture_command():
+    """Determine the optimal screenshot backend based on active desktop and available tools."""
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+
+    if "kde" in desktop and shutil.which("spectacle"):
+        return ["spectacle", "-b", "-f", "-n", "-o", SHM_BUFFER]
+
+    if "gnome" in desktop:
+        if shutil.which("gdbus"):
+            return [
+                "gdbus", "call", "--session",
+                "--dest", "org.gnome.Shell.Screenshot",
+                "--object-path", "/org/gnome/Shell/Screenshot",
+                "--method", "org.gnome.Shell.Screenshot.Screenshot",
+                "true", "false", SHM_BUFFER
+            ]
+        if shutil.which("gnome-screenshot"):
+            return ["gnome-screenshot", "-f", SHM_BUFFER]
+
+    if shutil.which("grim"):
+        return ["grim", SHM_BUFFER]
+
+    if shutil.which("spectacle"):
+        return ["spectacle", "-b", "-f", "-n", "-o", SHM_BUFFER]
+
+    return None
+
 
 def get_input_fds():
     """Discover and open all available evdev input nodes in non-blocking mode."""
     fds = {}
-    for dev in sorted(glob.glob("/dev/input/event*")):
+    for dev_path in sorted(glob.glob("/dev/input/event*")):
         try:
-            fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
-            fds[fd] = dev
+            fd = os.open(dev_path, os.O_RDONLY | os.O_NONBLOCK)
+            fds[fd] = dev_path
         except (PermissionError, OSError):
             pass
     return fds
 
-def capture_screenshot():
-    """Trigger background capture and stream directly to Wayland clipboard."""
+
+def capture_screenshot(cmd):
+    """Capture full screen to shared memory RAM and pipe asynchronously into clipboard."""
+    if not cmd:
+        return
+
     env = os.environ.copy()
     if "WAYLAND_DISPLAY" not in env:
         env["WAYLAND_DISPLAY"] = "wayland-0"
@@ -54,21 +91,21 @@ def capture_screenshot():
         except OSError:
             pass
 
-    # 1. Native compositor screen grab directly into shared memory RAM
+    # Execute backend capture quietly into RAM buffer
     subprocess.run(
-        ["/usr/bin/spectacle", "-b", "-f", "-n", "-o", SHM_BUFFER],
+        cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         env=env
     )
 
-    # 2. Asynchronous pipe injection into Wayland clipboard
+    # Stream raw image bytes into Wayland clipboard
     if os.path.exists(SHM_BUFFER) and os.path.getsize(SHM_BUFFER) > 100:
         try:
-            with open(SHM_BUFFER, "rb") as f:
+            with open(SHM_BUFFER, "rb") as fp:
                 subprocess.Popen(
                     ["wl-copy", "-t", "image/png"],
-                    stdin=f,
+                    stdin=fp,
                     env=env,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL
@@ -76,16 +113,26 @@ def capture_screenshot():
         except Exception:
             pass
 
-def signal_handler(signum, frame):
-    sys.exit(0)
 
 def main():
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    def handle_exit(signum, frame):
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, handle_exit)
+    signal.signal(signal.SIGTERM, handle_exit)
+
+    capture_cmd = detect_capture_command()
+    if not capture_cmd:
+        sys.stderr.write("wayland-zeroprint: No supported screenshot backend found (spectacle, grim, or gnome-screenshot).\n")
+        sys.exit(1)
+
+    if not shutil.which("wl-copy"):
+        sys.stderr.write("wayland-zeroprint: 'wl-copy' (wl-clipboard) not found in PATH.\n")
+        sys.exit(1)
 
     fds = get_input_fds()
     if not fds:
-        sys.stderr.write("wayland-zeroprint: No readable /dev/input/event* devices found. Check udev permissions.\n")
+        sys.stderr.write("wayland-zeroprint: No readable /dev/input/event* nodes found. Check udev permissions or group membership.\n")
         sys.exit(1)
 
     poll_obj = select.poll()
@@ -97,8 +144,9 @@ def main():
     while True:
         try:
             events = poll_obj.poll(1000)
+
+            # Refresh descriptors on timeout to handle hotplugged keyboards
             if not events:
-                # Refresh file descriptors for hotplugged input devices
                 new_fds = get_input_fds()
                 if set(new_fds.keys()) != set(fds.keys()):
                     for fd in list(fds.keys()):
@@ -115,23 +163,26 @@ def main():
             for fd, event in events:
                 if event & select.POLLIN:
                     try:
-                        data = os.read(fd, EVENT_SIZE * 16)
-                        if not data:
+                        chunk = os.read(fd, EVENT_SIZE * 16)
+                        if not chunk:
                             continue
 
-                        for i in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
-                            sec, usec, ev_type, code, value = struct.unpack(EVENT_FORMAT, data[i:i + EVENT_SIZE])
+                        for offset in range(0, len(chunk) - EVENT_SIZE + 1, EVENT_SIZE):
+                            sec, usec, ev_type, code, value = struct.unpack(
+                                EVENT_FORMAT, chunk[offset:offset + EVENT_SIZE]
+                            )
 
-                            # Detect hardware key press (value == 1: KEY_DOWN)
+                            # Trigger on key down (value == 1) for PrintScreen / SysRq
                             if ev_type == EV_KEY and code in (KEY_SYSRQ, KEY_PRINT) and value == 1:
                                 now = time.time()
-                                if now - last_trigger > 0.35:
+                                if now - last_trigger > 0.30:
                                     last_trigger = now
-                                    capture_screenshot()
+                                    capture_screenshot(capture_cmd)
                     except (BlockingIOError, OSError):
                         pass
         except Exception:
             time.sleep(0.5)
+
 
 if __name__ == "__main__":
     main()

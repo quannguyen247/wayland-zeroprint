@@ -1,2 +1,5 @@
-# Allow unprivileged user space daemons to read input events without root
-KERNEL=="event*", SUBSYSTEM=="input", MODE="0666"
+# Grant active local desktop seat read access to evdev input events
+KERNEL=="event*", SUBSYSTEM=="input", TAG+="uaccess"
+
+# Fallback permissions for non-systemd environments or input group members
+KERNEL=="event*", SUBSYSTEM=="input", GROUP="input", MODE="0660"
