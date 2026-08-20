@@ -1,0 +1,2 @@
+# Allow unprivileged user space daemons to read input events without root
+KERNEL=="event*", SUBSYSTEM=="input", MODE="0666"
