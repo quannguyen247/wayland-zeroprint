@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# Temp files
+*.png
+*.tmp
+/dev/shm/
+/tmp/
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
