@@ -72,24 +72,24 @@ On modern Linux Wayland desktop environments (most notably **KDE Plasma 6** and 
 
 ---
 
-## Deep Dive: The 4-Stage Real-Time Pipeline (< 40ms Total Latency)
+## Deep Dive: The 4-Stage Execution Pipeline
 
 ```
 [ Physical Keypress ] ──(0.08ms)──> [ Kernel evdev ] ──(0.02ms)──> [ Daemon Wakeup ]
                                                                           │
                                                                  (Headless Backend)
                                                                           │
-[ Clipboard Ready ] <──(0.5ms)── [ /dev/shm RAM tmpfs ] <──(35ms)─────────┘
+[ Clipboard Ready ] <──(0.5ms)── [ /dev/shm RAM tmpfs ] <─────────────────┘
 ```
 
 1. **Stage 1: Kernel evdev Interrupt (< 0.1ms)**
-   When you press the physical key switch, the USB HID interrupt hits the Linux kernel. The kernel input subsystem instantly wakes `wayland-zeroprint` via a non-blocking `select.poll()` system call (~0.08ms). Traditional shortcut daemons route events through Compositors, D-Bus, and user-space shortcut dispatchers (taking 20ms–50ms, or getting dropped entirely). `wayland-zeroprint` is **~300x faster** at key interception with 100% reliability.
+   When you press the physical key switch, the USB HID interrupt hits the Linux kernel. The kernel input subsystem instantly wakes `wayland-zeroprint` via a non-blocking `select.poll()` system call (~0.08ms). Traditional shortcut daemons route events through Compositors, D-Bus, and user-space shortcut dispatchers (taking 20ms–50ms, or getting dropped entirely when a modal menu is open). `wayland-zeroprint` intercepts the key at the hardware driver level with 100% reliability.
 
 2. **Stage 2: Zero Disk I/O RAM Buffer (Nanosecond Latency)**
-   Instead of writing temporary files to physical SSD/NVMe storage (which incurs 2ms–10ms I/O latency and NAND write wear), the frame is dumped directly into `/dev/shm` (shared physical RAM tmpfs). Memory read/write speeds exceed **40,000 MB/s to 60,000 MB/s**, eliminating storage bottlenecks completely.
+   Instead of writing temporary files to physical SSD/NVMe storage (which incurs filesystem journal overhead and NAND write wear), the frame is dumped directly into `/dev/shm` (shared physical RAM tmpfs). Memory read/write speeds exceed **40,000 MB/s to 60,000 MB/s**, eliminating storage bottlenecks completely.
 
-3. **Stage 3: Headless Framebuffer Dump (~35ms)**
-   The daemon invokes the backend in pure headless mode (e.g. `spectacle -b -f -n -o`), bypassing Qt/GTK GUI rendering, blur shaders, and editor window lifecycles (saving 300ms–500ms of visual overhead).
+3. **Stage 3: Headless Framebuffer Capture**
+   The daemon invokes the compositor's headless capture tool (e.g. `spectacle -b -f -n -o` on KDE, `gdbus` on GNOME, or `grim` on wlroots), capturing the full frame while bypassing GUI rendering, window animations, and interactive dialogs.
 
 4. **Stage 4: Asynchronous Stream Injection (~0.52ms)**
    Using non-blocking asynchronous pipes (`subprocess.Popen`), the raw byte buffer in `/dev/shm` is streamed into `wl-copy -t image/png` in just **0.52ms**. The clipboard is ready for immediate `Ctrl+V` pasting.
