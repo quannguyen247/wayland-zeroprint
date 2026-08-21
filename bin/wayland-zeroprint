@@ -5,7 +5,7 @@ wayland-zeroprint: Zero-Drop Hardware PrintScreen Daemon for Linux Wayland.
 Intercepts physical PrintScreen interrupts from Linux evdev input nodes,
 bypassing Wayland compositor grab locks and popup dismissal, capturing
 lossless frames directly to shared memory (/dev/shm) and streaming them
-to the Wayland clipboard via wl-copy.
+to the Wayland clipboard via wl-copy without onlyReplaceEmpty lockouts.
 """
 
 import glob
@@ -24,7 +24,6 @@ KEY_SYSRQ = 99
 KEY_PRINT = 210
 
 # 64-bit Linux struct input_event layout:
-# timeval (16 bytes: tv_sec 8B, tv_usec 8B), type (2B), code (2B), value (4B) = 24 bytes
 EVENT_FORMAT = "@qqHHi"
 EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
 
@@ -83,7 +82,6 @@ def capture_screenshot(cmd):
     if "XDG_RUNTIME_DIR" not in env:
         env["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
     env["DISPLAY"] = env.get("DISPLAY", ":0")
-    env["QT_LOGGING_RULES"] = "*=false"
 
     if os.path.exists(SHM_BUFFER):
         try:
@@ -99,7 +97,7 @@ def capture_screenshot(cmd):
         env=env
     )
 
-    # Stream raw image bytes into Wayland clipboard
+    # Forceful byte stream injection into Wayland clipboard, avoiding onlyReplaceEmpty lockouts
     if os.path.exists(SHM_BUFFER) and os.path.getsize(SHM_BUFFER) > 100:
         try:
             with open(SHM_BUFFER, "rb") as fp:
@@ -175,7 +173,7 @@ def main():
                             # Trigger on key down (value == 1) for PrintScreen / SysRq
                             if ev_type == EV_KEY and code in (KEY_SYSRQ, KEY_PRINT) and value == 1:
                                 now = time.time()
-                                if now - last_trigger > 0.30:
+                                if now - last_trigger > 0.35:
                                     last_trigger = now
                                     capture_screenshot(capture_cmd)
                     except (BlockingIOError, OSError):
