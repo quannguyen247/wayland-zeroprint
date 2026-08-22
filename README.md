@@ -216,6 +216,19 @@ make uninstall
 
 ---
 
+## Architectural Trade-offs & Limitations
+
+While `wayland-zeroprint` provides a zero-configuration, grab-immune capture pipeline, operating at the kernel `evdev` driver layer introduces specific architectural trade-offs:
+
+1. **Hardware Scancodes vs. Software Keymaps**:
+   The daemon binds directly to kernel-level scancodes (`KEY_SYSRQ` 99, `KEY_PRINT` 210). Software-level key remapping configured in Desktop Environments (e.g. XKB layout remapping, desktop shortcut overrides, or virtual/touchscreen keyboards) will not trigger the daemon.
+2. **Workaround Nature vs. Upstream Fixes**:
+   This daemon acts as a lightweight, independent workaround for desktop environments experiencing shortcut dispatcher drops over complex UI surfaces (XWayland windows, transient menus). For native desktop integration, resolving shortcut dispatcher behavior directly in upstream compositors remains the ideal architectural solution.
+3. **Application Privacy Hooks**:
+   Direct hardware interception bypasses user-space application lifecycle hooks that may attempt to obscure sensitive content (such as password managers) prior to a screenshot request.
+
+---
+
 ## License
 
 This project is licensed under the **Apache License 2.0**. See the [LICENSE](LICENSE) file for complete terms.
