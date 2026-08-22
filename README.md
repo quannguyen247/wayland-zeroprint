@@ -2,28 +2,28 @@
 
 **Zero-drop, hardware-level PrintScreen daemon for Linux Wayland compositors (KDE Plasma 6, GNOME, wlroots).**
 
-`wayland-zeroprint` captures full-resolution, lossless screenshots directly into the Wayland clipboard memory buffer by reading hardware interrupts via the Linux kernel `evdev` subsystem. It completely bypasses compositor input grabs, eliminates dropped keystrokes, and preserves open popups and context menus without interrupting desktop focus.
+`wayland-zeroprint` captures full-resolution, lossless screenshots directly into the Wayland clipboard memory buffer by reading hardware interrupts via the Linux kernel `evdev` subsystem. It eliminates dropped keystrokes, provides a zero-configuration experience across desktop environments, and preserves open popups and context menus without interrupting desktop focus.
 
 ---
 
-## The Problem: The Wayland Input Grab Dilemma
+## The Motivation: Reliable, Zero-Config Screenshots on Wayland
 
-On modern Linux Wayland desktop environments (most notably **KDE Plasma 6** and **GNOME Shell**), pressing the physical `PrintScreen` key frequently fails or behaves erratically under common desktop conditions:
+On modern Linux Wayland desktop environments (**KDE Plasma 6**, **GNOME Shell**, and **wlroots**), capturing seamless screenshots often presents practical challenges:
 
-1. **Exclusive Input Grabs (The "Swallowed Key" Bug)**:
-   When a context menu (right-click), system tray popup (Wi-Fi, Audio, Battery), or taskbar thumbnail is open, the compositor or desktop shell acquires an *exclusive input grab*. User-space global shortcut daemons (such as KDE's `kglobalaccel` or GNOME's hotkey listener) are blocked from receiving non-modifier keys like `PrintScreen`. As a result, the keystroke is silently discarded.
+1. **User-Space Shortcut Dispatcher Drops**:
+   When interacting with complex desktop states (system tray popups, dropdown context menus, fullscreen games, or legacy XWayland windows), user-space shortcut managers (such as KDE's `kglobalaccel`) can experience latency or occasionally drop non-modifier keys like `PrintScreen`.
 
 2. **Transient UI Dismissal**:
-   Triggering desktop notifications or launching external GUI screenshot tools breaks the active `xdg_popup` surface state. The open menu or dropdown immediately closes before the frame can be grabbed, making it impossible to capture tooltips or cascading menus.
+   Triggering full GUI screenshot utilities or dispatching desktop notifications can disrupt active `xdg_popup` surface states, closing dropdowns or tooltips before the frame can be grabbed.
 
-3. **Disk I/O & Process Overhead**:
-   Standard tools often spawn full GUI processes and write temporary files to physical storage, adding 300ms–600ms of latency before the image reaches your clipboard.
+3. **Multi-Compositor Fragmentation**:
+   Every desktop environment requires different shortcut configurations and backends. `wayland-zeroprint` provides a single, unified daemon that auto-detects your compositor and works out-of-the-box everywhere.
 
 ---
 
 ## The Solution: Hardware-Level evdev Pipeline
 
-`wayland-zeroprint` operates directly below the Wayland compositor layer by attaching to the Linux kernel input event subsystem (`/dev/input/event*`):
+`wayland-zeroprint` operates directly below the desktop environment layer by attaching to the Linux kernel input event subsystem (`/dev/input/event*`):
 
 ```
 ┌─────────────────────────┐
@@ -40,7 +40,7 @@ On modern Linux Wayland desktop environments (most notably **KDE Plasma 6** and 
 ┌─────────────────────────────────────────────────────────────┐
 │                 wayland-zeroprint Daemon                    │
 │                                                             │
-│  - Bypasses Wayland compositor input grabs completely       │
+│  - Kernel-level hardware trigger (never drops keystrokes)   │
 │  - Silent execution (no notifications, popup-safe)          │
 │  - Auto-detects compositor: KDE / GNOME / wlroots           │
 └──────┬───────────────────────────────────────────────┬──────┘
@@ -61,7 +61,7 @@ On modern Linux Wayland desktop environments (most notably **KDE Plasma 6** and 
 
 ### Core Architectural Features
 
-* **Grab-Immune Hardware Trigger**: Listens for `KEY_SYSRQ (99)` and `KEY_PRINT (210)` at the kernel level. Input grabs from taskbars, context menus, or fullscreen games cannot block the daemon.
+* **Kernel-Level Hardware Trigger**: Listens for `KEY_SYSRQ (99)` and `KEY_PRINT (210)` directly at the kernel driver layer. Immune to user-space shortcut dispatcher dropouts and XWayland focus quirks.
 * **Zero Disk I/O**: Captures are written directly to shared memory (`/dev/shm/wayland_zeroprint.png` on tmpfs RAM), reducing write latency to nanoseconds and preserving SSD lifespan.
 * **Sub-Millisecond Clipboard Injection**: Streams the raw in-memory PNG buffer into `wl-copy` asynchronously in ~0.5ms.
 * **Pure Silent Execution**: Dispatches no desktop notifications and creates no focus stealing windows, ensuring open dropdowns, taskbar menus, and tooltips stay open on screen.
