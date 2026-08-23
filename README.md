@@ -217,14 +217,16 @@ make uninstall
 
 ## Architectural Trade-offs & Limitations
 
-While `wayland-zeroprint` provides a zero-configuration, grab-immune capture pipeline, operating at the kernel `evdev` driver layer introduces specific architectural trade-offs:
+While `wayland-zeroprint` provides a zero-configuration, sub-16ms, grab-immune capture pipeline, operating across the kernel `evdev` driver and compositor D-Bus layers introduces specific architectural and security trade-offs:
 
 1. **Hardware Scancodes vs. Software Keymaps**:
-   The daemon binds directly to kernel-level scancodes (`KEY_SYSRQ` 99, `KEY_PRINT` 210). Software-level key remapping configured in Desktop Environments (e.g. XKB layout remapping, desktop shortcut overrides, or virtual/touchscreen keyboards) will not trigger the daemon.
-2. **Workaround Nature vs. Upstream Fixes**:
-   This daemon acts as a lightweight, independent workaround for desktop environments experiencing shortcut dispatcher drops over complex UI surfaces (XWayland windows, transient menus). For native desktop integration, resolving shortcut dispatcher behavior directly in upstream compositors remains the ideal architectural solution.
+   The daemon binds directly to kernel-level input scancodes (`KEY_SYSRQ` 99, `KEY_PRINT` 210). Software-level key remapping configured in Desktop Environments (e.g. XKB layout remapping, desktop shortcut overrides, or virtual/touchscreen keyboards) will not trigger the daemon.
+2. **KWin Permission Check Bypass (`KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1`)**:
+   To achieve sub-16ms headless captures without interactive confirmation popups or heavy Spectacle CLI spawning, the installer provisions `KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1`. This allows user-session tools to capture frames via `org.kde.KWin.ScreenShot2` without interactive authentication prompts.
 3. **Application Privacy Hooks**:
-   Direct hardware interception bypasses user-space application lifecycle hooks that may attempt to obscure sensitive content (such as password managers) prior to a screenshot request.
+   Direct hardware interception bypasses user-space application lifecycle hooks that may attempt to obscure sensitive content (such as password managers or secure messaging windows) prior to a screenshot request.
+4. **Workaround Nature vs. Upstream Fixes**:
+   This daemon acts as a lightweight, independent workaround for desktop environments experiencing shortcut dispatcher drops over complex UI surfaces (XWayland windows, transient menus). For native desktop integration, resolving shortcut dispatcher behavior directly in upstream compositors remains the ideal architectural solution.
 
 ---
 
