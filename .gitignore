@@ -15,3 +15,7 @@ __pycache__/
 .vscode/
 .idea/
 *.swp
+
+# Binaries
+bin/
+

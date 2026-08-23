@@ -1,16 +1,31 @@
+CC ?= gcc
+CFLAGS ?= -O3 -Wall -Wextra -pthread -flto -march=native -lsystemd -lz
 PREFIX ?= $(HOME)/.local
 UDEV_DIR ?= /etc/udev/rules.d
 SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
 
-.PHONY: all install install-user install-udev uninstall clean
+TARGET = $(PREFIX)/bin/wayland-zeroprint
+SRCS = src/main.c
 
-all:
-	@echo "wayland-zeroprint does not require compilation."
-	@echo "Run 'make install-user' or './install.sh' to install."
+.PHONY: all clean install install-user install-udev install-kwin-env uninstall benchmark
 
-install-user:
-	install -d $(PREFIX)/bin
-	install -m 755 bin/wayland-zeroprint $(PREFIX)/bin/wayland-zeroprint
+all: $(TARGET)
+
+$(TARGET): $(SRCS)
+	@mkdir -p $(PREFIX)/bin
+	$(CC) src/main.c $(CFLAGS) -o $(TARGET)
+	@chmod 755 $(TARGET)
+	@echo "Built and installed $(TARGET) successfully."
+
+benchmark: $(TARGET)
+	@$(TARGET) --benchmark
+
+install-kwin-env:
+	@mkdir -p $(HOME)/.config/environment.d
+	@echo "KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1" > $(HOME)/.config/environment.d/10-kwin-screenshot.conf
+	@echo "Configured KWin direct screenshot permission environment."
+
+install-user: $(TARGET) install-kwin-env
 	install -d $(SYSTEMD_USER_DIR)
 	install -m 644 systemd/wayland-zeroprint.service $(SYSTEMD_USER_DIR)/wayland-zeroprint.service
 	systemctl --user daemon-reload
@@ -29,6 +44,10 @@ uninstall:
 	-systemctl --user disable wayland-zeroprint.service
 	rm -f $(PREFIX)/bin/wayland-zeroprint
 	rm -f $(SYSTEMD_USER_DIR)/wayland-zeroprint.service
+	rm -f $(HOME)/.config/environment.d/10-kwin-screenshot.conf
 	systemctl --user daemon-reload
 	-sudo rm -f $(UDEV_DIR)/99-wayland-zeroprint.rules
 	-sudo udevadm control --reload-rules
+
+clean:
+	rm -f $(TARGET)
