@@ -213,6 +213,14 @@ To completely remove `wayland-zeroprint` and its udev rules:
 make uninstall
 ```
 
+## Security & Volatility Design
+
+`wayland-zeroprint` is engineered with explicit memory and persistence principles to balance speed and data privacy:
+
+* **In-Memory Volatility**: Captures reside exclusively in `/dev/shm` (Linux tmpfs physical RAM). Data is never committed to persistent disk blocks, eliminating residual image artifacts on physical SSD/NVMe flash storage and vanishing entirely across system reboots.
+* **Atomic Overwriting Buffer**: Successive screenshot triggers atomically overwrite `/dev/shm/wayland_zeroprint.png`, preventing historical image buildup or unmonitored disk accumulation.
+* **Least-Privilege Execution**: The background daemon executes entirely within user space under standard user credentials, relying on localized `uaccess` rules for `/dev/input` and standard session D-Bus endpoints.
+
 ---
 
 ## Architectural Trade-offs & Limitations
