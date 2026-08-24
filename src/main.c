@@ -29,6 +29,8 @@
 #include <sys/ioctl.h>
 #include <linux/input.h>
 #include <systemd/sd-bus.h>
+#include <drm/drm.h>
+#include <drm/drm_mode.h>
 #include <zlib.h>
 
 #define VERSION "2.2.0"
@@ -169,7 +171,39 @@ static int write_png_rgba(const char *filename, const uint8_t *rgba, uint32_t wi
     return 0;
 }
 
-/* Ultra-Fast Direct KWin D-Bus Capture Engine (~9ms) */
+/* Detect physical monitor native dimensions (e.g. 1920x1080) to eliminate fractional scaling blur */
+static void get_native_screen_resolution(uint32_t *width, uint32_t *height) {
+    *width = 1920;
+    *height = 1080;
+
+    int drm_fd = open("/dev/dri/card1", O_RDONLY | O_CLOEXEC);
+    if (drm_fd < 0) drm_fd = open("/dev/dri/card0", O_RDONLY | O_CLOEXEC);
+    if (drm_fd >= 0) {
+        struct drm_mode_card_res res;
+        memset(&res, 0, sizeof(res));
+        uint32_t crtc_ids[32];
+        res.count_crtcs = 32;
+        res.crtc_id_ptr = (uint64_t)(uintptr_t)crtc_ids;
+
+        if (ioctl(drm_fd, DRM_IOCTL_MODE_GETRESOURCES, &res) == 0) {
+            for (uint32_t i = 0; i < res.count_crtcs; i++) {
+                struct drm_mode_crtc crtc;
+                memset(&crtc, 0, sizeof(crtc));
+                crtc.crtc_id = crtc_ids[i];
+                if (ioctl(drm_fd, DRM_IOCTL_MODE_GETCRTC, &crtc) == 0 && crtc.mode_valid && crtc.fb_id != 0) {
+                    if (crtc.mode.hdisplay > 0 && crtc.mode.vdisplay > 0) {
+                        *width = crtc.mode.hdisplay;
+                        *height = crtc.mode.vdisplay;
+                        break;
+                    }
+                }
+            }
+        }
+        close(drm_fd);
+    }
+}
+
+/* Ultra-Fast Direct KWin D-Bus Capture Engine (100% Native Pixel-Perfect Resolution) */
 static bool capture_kwin_direct_dbus(void) {
     if (!g_user_bus) {
         if (sd_bus_open_user(&g_user_bus) < 0) return false;
@@ -184,22 +218,26 @@ static bool capture_kwin_direct_dbus(void) {
         return false;
     }
 
+    uint32_t native_w = 1920, native_h = 1080;
+    get_native_screen_resolution(&native_w, &native_h);
+
     sd_bus_error error = SD_BUS_ERROR_NULL;
     sd_bus_message *m = NULL;
     sd_bus_message *reply = NULL;
     int r;
 
+    // Use CaptureArea with native physical pixel dimensions to guarantee 1:1 pixel crispness
     r = sd_bus_message_new_method_call(g_user_bus, &m,
                                        "org.kde.KWin",
                                        "/org/kde/KWin/ScreenShot2",
                                        "org.kde.KWin.ScreenShot2",
-                                       "CaptureWorkspace");
+                                       "CaptureArea");
     if (r < 0) {
         close(mem_fd);
         return false;
     }
 
-    // Empty options map a{sv}
+    sd_bus_message_append(m, "iiuu", 0, 0, native_w, native_h);
     sd_bus_message_open_container(m, 'a', "{sv}");
     sd_bus_message_close_container(m);
     sd_bus_message_append(m, "h", mem_fd);
