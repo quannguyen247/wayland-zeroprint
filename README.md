@@ -2,7 +2,7 @@
 
 **Zero-drop, hardware-level PrintScreen daemon for Linux Wayland compositors (KDE Plasma 6, GNOME, wlroots).**
 
-`wayland-zeroprint` captures full-resolution, lossless screenshots directly into the Wayland clipboard memory buffer by reading hardware interrupts via the Linux kernel `evdev` subsystem. It eliminates dropped keystrokes, provides a zero-configuration experience across desktop environments, and preserves open popups and context menus without interrupting desktop focus.
+`wayland-zeroprint` captures lossless screenshots for the Wayland clipboard by listening to Linux `evdev` key events and delegating frame capture to the compositor. On KWin it requests the compositor's native-resolution workspace frame, so fractional scaling does not turn a 1536×864 logical capture into a blurred upscale or an incorrectly sized 1920×1080 area.
 
 ---
 
@@ -35,12 +35,12 @@ On modern Linux Wayland desktop environments (**KDE Plasma 6**, **GNOME Shell**,
 │ Linux Kernel: evdev subsystem  │
 │   (/dev/input/event*)   │
 └───────────┬─────────────┘
-            │  select.poll() (< 0.1ms non-blocking wake)
+            │  epoll_wait() (idle until the key event arrives)
             ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                 wayland-zeroprint Daemon                    │
 │                                                             │
-│  - Kernel-level hardware trigger (never drops keystrokes)   │
+│  - Kernel-level hardware trigger (independent of desktop shortcuts) │
 │  - Silent execution (no notifications, popup-safe)          │
 │  - Auto-detects compositor: KDE / GNOME / wlroots           │
 └──────┬───────────────────────────────────────────────┬──────┘
@@ -48,8 +48,8 @@ On modern Linux Wayland desktop environments (**KDE Plasma 6**, **GNOME Shell**,
        ▼                                               ▼
 ┌─────────────────────────────┐         ┌─────────────────────────────┐
 │  Compositor Frame Grab      │         │   Asynchronous Streamer     │
-│  Writes raw PNG to /dev/shm │ ──────> │   Pipes buffer to wl-copy   │
-│  (Zero Disk I/O, tmpfs RAM) │         │   into Wayland clipboard    │
+│  Native raw frame + PNG    │ ──────> │   Pipes complete PNG to      │
+│  /dev/shm tmpfs, atomic    │         │   wl-copy clipboard          │
 └─────────────────────────────┘         └──────────────┬──────────────┘
                                                        │
                                                        ▼
@@ -62,9 +62,9 @@ On modern Linux Wayland desktop environments (**KDE Plasma 6**, **GNOME Shell**,
 ### Core Architectural Features
 
 * **Kernel-Level Hardware Trigger**: Listens for `KEY_SYSRQ (99)` and `KEY_PRINT (210)` directly at the kernel driver layer. Immune to user-space shortcut dispatcher dropouts and XWayland focus quirks.
-* **Direct KWin D-Bus IPC Engine**: Directly communicates with KWin's compositor frame sink via native `sd-bus` with zero-copy `memfd` file descriptors, eliminating Spectacle CLI process startup and OCR neural network initialization overhead completely.
-* **Zero Disk I/O**: Captures are written directly to shared memory (`/dev/shm/wayland_zeroprint.png` on tmpfs RAM), reducing write latency to nanoseconds and preserving SSD lifespan.
-* **Sub-Millisecond Clipboard Injection**: Streams the raw in-memory PNG buffer into `wl-copy` asynchronously in ~0.5ms.
+* **KWin native-resolution capture**: Calls `org.kde.KWin.ScreenShot2.CaptureWorkspace` with `native-resolution=true`; it does not guess physical dimensions from DRM or misuse logical `CaptureArea` coordinates.
+* **Correct raw-frame transport**: Receives KWin's asynchronous raw QImage stream through a pipe, validates its metadata, drains the complete frame before PNG compression, and handles QImage pixel formats explicitly.
+* **Atomic tmpfs output**: Writes a per-process temporary PNG under `/dev/shm`, then renames it to `/dev/shm/wayland_zeroprint.png`; clipboard readers never see a partially written image.
 * **Pure Silent Execution**: Dispatches no desktop notifications and creates no focus stealing windows, ensuring open dropdowns, taskbar menus, and tooltips stay open on screen.
 * **Universal Compositor Support**: Features automated detection with seamless fallbacks (`gdbus` on GNOME, `grim` on wlroots/Hyprland, and `spectacle` fallback on KDE).
 
@@ -73,24 +73,24 @@ On modern Linux Wayland desktop environments (**KDE Plasma 6**, **GNOME Shell**,
 ## Deep Dive: The 4-Stage Execution Pipeline
 
 ```
-[ Physical Keypress ] ──(0.01ms)──> [ Kernel evdev epoll ] ──(nanoseconds)──> [ Async pthread Worker ]
+[ Physical Keypress ] ──> [ Kernel evdev epoll ] ──> [ Async pthread Worker ]
                                                                                        │
-                                                                           (Direct KWin D-Bus / sd-bus)
+                                                          (KWin D-Bus + native-resolution)
                                                                                        │
-[ Clipboard Ready ] <──────(0.5ms)────── [ /dev/shm RAM tmpfs ] <──────────────────────┘
+[ Clipboard Ready ] <────── [ atomic PNG + wl-copy ] <──────────────────────────────────┘
 ```
 
-1. **Stage 1: Kernel evdev Interrupt (< 0.01ms / 10µs)**
-   When you press the physical key switch, the USB HID interrupt hits the Linux kernel. The kernel input subsystem instantly wakes `wayland-zeroprint` via an `epoll_wait()` system call (~0.01ms / 10µs). Traditional shortcut daemons route events through Compositors, D-Bus, and user-space shortcut dispatchers (taking 20ms–50ms, or getting dropped entirely when a modal menu is open). `wayland-zeroprint` intercepts the key at the hardware driver level with 100% reliability.
+1. **Stage 1: Kernel evdev event**
+   The daemon watches `/dev/input/event*` with `epoll_wait()` and wakes when the kernel reports `KEY_SYSRQ` or `KEY_PRINT`. The exact wake-up time depends on the kernel, device and scheduler; it is measured locally rather than promised as a fixed number.
 
 2. **Stage 2: Asynchronous Worker Non-Blocking Dispatch**
-   Upon receiving the keydown event, the main `epoll` listener signals a dedicated background worker thread via `pthread_cond_signal()` in nanoseconds and immediately returns to listening. The input event loop is never frozen by frame capture operations.
+   Upon receiving the keydown event, the main listener signals a dedicated worker and immediately returns to listening. Frame capture and PNG work do not block the input loop.
 
 3. **Stage 3: Direct KWin D-Bus Frame Sink & Pure C PNG Encoder**
-   On KDE Plasma 6, the worker communicates directly with KWin (`org.kde.KWin.ScreenShot2`) via `sd-bus`, passing an anonymous in-memory file descriptor (`memfd`). KWin hardware-blits the screen into the shared memory descriptor in **~9ms**. The worker compresses the raw ARGB pixels using an in-memory `zlib` PNG encoder with zero external dependencies.
+   On KDE Plasma 6, the worker calls `org.kde.KWin.ScreenShot2.CaptureWorkspace` with `native-resolution=true`. KWin returns raw QImage metadata and pixels through a pipe. The worker drains the complete frame first, converts supported QImage formats to RGBA, and compresses it with zlib.
 
-4. **Stage 4: Asynchronous Stream Injection (~0.5ms)**
-   Using non-blocking pipes, the raw byte buffer in `/dev/shm` is streamed into `wl-copy -t image/png`. The clipboard is ready for immediate `Ctrl+V` pasting.
+4. **Stage 4: Atomic clipboard publication**
+   The completed PNG is atomically renamed into `/dev/shm/wayland_zeroprint.png`, then streamed into `wl-copy -t image/png`. Temporary files are removed on failure.
 
 ---
 
@@ -98,12 +98,11 @@ On modern Linux Wayland desktop environments (**KDE Plasma 6**, **GNOME Shell**,
 
 | Metric | Standard GUI Screenshot | wayland-zeroprint (Native C + Direct KWin) |
 | :--- | :--- | :--- |
-| **Key Intercept Latency** | 15ms – 50ms (or dropped entirely) | **< 0.01ms** (`epoll` hardware interrupt wake) |
-| **Frame Capture Latency** | 300ms – 650ms (Spectacle/OCR start) | **~9ms – 16ms** (Direct KWin D-Bus sink) |
-| **Storage Medium** | Disk storage (`/tmp` on SSD/HDD) | **Shared RAM** (`/dev/shm` tmpfs) |
-| **Clipboard Delivery Latency** | 40ms+ (Synchronous file load) | **~0.5ms** (Asynchronous pipe) |
-| **RAM Footprint** | ~120 MB (Qt / GTK GUI framework) | **~348 KB** (Compiled Native C ELF binary) |
-| **Idle CPU Utilization** | N/A | **0.00%** (`epoll_wait()` kernel sleep) |
+| **Key handling** | Desktop-dependent | `evdev` + `epoll` + worker thread |
+| **KWin capture** | Desktop-dependent | Native-resolution raw frame via `ScreenShot2` |
+| **Output** | Utility-dependent | Atomic PNG in `/dev/shm`, then `wl-copy` |
+| **Measured example** | Not measured here | 20–48 ms observed for capture + PNG on 1920×1080 at scale 1.25; content and system load affect the result |
+| **Idle behavior** | N/A | Sleeps in `epoll_wait()` |
 
 ---
 
@@ -225,15 +224,17 @@ make uninstall
 
 ## Architectural Trade-offs & Limitations
 
-While `wayland-zeroprint` provides a zero-configuration, sub-16ms, grab-immune capture pipeline, operating across the kernel `evdev` driver and compositor D-Bus layers introduces specific architectural and security trade-offs:
+Operating across the kernel `evdev` driver and compositor D-Bus layers introduces specific architectural and security trade-offs:
 
 1. **Hardware Scancodes vs. Software Keymaps**:
    The daemon binds directly to kernel-level input scancodes (`KEY_SYSRQ` 99, `KEY_PRINT` 210). Software-level key remapping configured in Desktop Environments (e.g. XKB layout remapping, desktop shortcut overrides, or virtual/touchscreen keyboards) will not trigger the daemon.
 2. **KWin Permission Check Bypass (`KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1`)**:
-   To achieve sub-16ms headless captures without interactive confirmation popups or heavy Spectacle CLI spawning, the installer provisions `KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1`. This allows user-session tools to capture frames via `org.kde.KWin.ScreenShot2` without interactive authentication prompts.
+   The installer provisions `KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1` so the user-session D-Bus capture can run without an interactive permission prompt. This is a security-sensitive setting and should only be enabled for a trusted local user session; it is not a latency guarantee.
 3. **Application Privacy Hooks**:
    Direct hardware interception bypasses user-space application lifecycle hooks that may attempt to obscure sensitive content (such as password managers or secure messaging windows) prior to a screenshot request.
-4. **Workaround Nature vs. Upstream Fixes**:
+4. **Mixed-monitor scale**:
+   KWin's native-resolution workspace capture uses one canvas scale. A single flat PNG cannot be a simultaneous 1:1 physical-pixel representation for outputs configured with different fractional scales; for that setup, capture a specific output with a compositor-aware backend.
+5. **Workaround Nature vs. Upstream Fixes**:
    This daemon acts as a lightweight, independent workaround for desktop environments experiencing shortcut dispatcher drops over complex UI surfaces (XWayland windows, transient menus). For native desktop integration, resolving shortcut dispatcher behavior directly in upstream compositors remains the ideal architectural solution.
 
 ---
@@ -243,4 +244,3 @@ While `wayland-zeroprint` provides a zero-configuration, sub-16ms, grab-immune c
 This project is licensed under the **Apache License 2.0**. See the [LICENSE](LICENSE) file for complete terms.
 
 Copyright (c) 2026 **Nguyen Dong Quan** (<nguyendongquan247@gmail.com>).
-

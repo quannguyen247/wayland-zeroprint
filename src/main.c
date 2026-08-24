@@ -1,7 +1,7 @@
 /*
  * wayland-zeroprint: Zero-Drop Hardware PrintScreen Daemon for Linux Wayland
  *
- * Direct KWin D-Bus Engine (9ms) + Multi-Compositor Universal Engine
+ * Direct KWin D-Bus Engine + Multi-Compositor Universal Engine
  *
  * Copyright (c) 2026 Nguyen Dong Quan <nguyendongquan247@gmail.com>
  * Licensed under the Apache License, Version 2.0
@@ -19,24 +19,25 @@
 #include <time.h>
 #include <signal.h>
 #include <dirent.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/inotify.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <sys/mman.h>
-#include <sys/ioctl.h>
 #include <linux/input.h>
 #include <systemd/sd-bus.h>
-#include <drm/drm.h>
-#include <drm/drm_mode.h>
 #include <zlib.h>
 
-#define VERSION "2.2.0"
+#define VERSION "1.1.1"
 #define MAX_EPOLL_EVENTS 64
 #define DEBOUNCE_MS 350.0
 #define SHM_PATH "/dev/shm/wayland_zeroprint.png"
+#define SHM_TMP_PREFIX "/dev/shm/.wayland_zeroprint.tmp"
+#define CAPTURE_TIMEOUT_MS 5000
+#define PNG_OUTPUT_CHUNK_SIZE (128 * 1024)
 
 #ifndef KEY_SYSRQ
 #define KEY_SYSRQ 99
@@ -63,6 +64,16 @@ static pthread_mutex_t g_work_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_work_cond = PTHREAD_COND_INITIALIZER;
 static bool g_work_pending = false;
 
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    uint32_t format;
+    double scale;
+} capture_metadata_t;
+
+static capture_metadata_t g_last_capture = {0};
+
 static void handle_signal(int sig) {
     (void)sig;
     g_running = 0;
@@ -80,222 +91,485 @@ static double get_time_us(void) {
     return (double)ts.tv_sec * 1000000.0 + (double)ts.tv_nsec / 1000.0;
 }
 
-static uint32_t bswap32(uint32_t v) {
-    return ((v >> 24) & 0xFF) | ((v >> 8) & 0xFF00) | ((v << 8) & 0xFF0000) | ((v << 24) & 0xFF000000);
+static void make_temp_path(char *buffer, size_t size) {
+    snprintf(buffer, size, "%s.%ld", SHM_TMP_PREFIX, (long)getpid());
 }
 
-/* Fast Pure-C In-Memory PNG Encoder */
-static int write_png_rgba(const char *filename, const uint8_t *rgba, uint32_t width, uint32_t height) {
-    FILE *f = fopen(filename, "wb");
-    if (!f) return -1;
+static bool write_all(FILE *f, const void *data, size_t size) {
+    return fwrite(data, 1, size, f) == size;
+}
 
-    const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
-    fwrite(sig, 1, 8, f);
+static bool write_be32(FILE *f, uint32_t value) {
+    const uint8_t bytes[4] = {
+        (uint8_t)(value >> 24),
+        (uint8_t)(value >> 16),
+        (uint8_t)(value >> 8),
+        (uint8_t)value
+    };
+    return write_all(f, bytes, sizeof(bytes));
+}
 
-    uint32_t ihdr_len = bswap32(13);
-    fwrite(&ihdr_len, 1, 4, f);
-    uint8_t ihdr[17];
-    memcpy(ihdr, "IHDR", 4);
-    uint32_t w = bswap32(width);
-    uint32_t h = bswap32(height);
-    memcpy(ihdr + 4, &w, 4);
-    memcpy(ihdr + 8, &h, 4);
-    ihdr[12] = 8; // 8-bit
-    ihdr[13] = 6; // RGBA
-    ihdr[14] = 0; // Deflate
-    ihdr[15] = 0; // Filter
-    ihdr[16] = 0; // Interlace
-    fwrite(ihdr, 1, 17, f);
-    uint32_t ihdr_crc = bswap32(crc32(0, ihdr, 17));
-    fwrite(&ihdr_crc, 1, 4, f);
-
-    size_t raw_line_len = width * 4 + 1;
-    size_t raw_size = raw_line_len * height;
-    uint8_t *raw_buf = malloc(raw_size);
-    if (!raw_buf) {
-        fclose(f);
-        return -1;
+static bool write_png_chunk(FILE *f, const char type[4], const uint8_t *data, uint32_t size) {
+    if (!write_be32(f, size) || !write_all(f, type, 4)) {
+        return false;
     }
 
-    for (uint32_t y = 0; y < height; y++) {
-        raw_buf[y * raw_line_len] = 0; // Filter None
-        const uint32_t *src_line = (const uint32_t *)(rgba + y * width * 4);
-        uint32_t *dst_line = (uint32_t *)(raw_buf + y * raw_line_len + 1);
-        for (uint32_t x = 0; x < width; x++) {
-            uint32_t pixel = src_line[x];
-            // Format: convert B G R A (KWin QImage ARGB32) to R G B A
-            uint32_t b = pixel & 0xFF;
-            uint32_t g = (pixel >> 8) & 0xFF;
-            uint32_t r = (pixel >> 16) & 0xFF;
-            uint32_t a = (pixel >> 24) & 0xFF;
-            dst_line[x] = (a << 24) | (b << 16) | (g << 8) | r;
+    uLong crc = crc32(0L, Z_NULL, 0);
+    crc = crc32(crc, (const Bytef *)type, 4);
+    if (size > 0) {
+        if (!write_all(f, data, size)) {
+            return false;
+        }
+        crc = crc32(crc, data, size);
+    }
+    return write_be32(f, (uint32_t)crc);
+}
+
+static int qimage_bytes_per_pixel(uint32_t format) {
+    switch (format) {
+        case 4:  /* QImage::Format_RGB32 */
+        case 5:  /* QImage::Format_ARGB32 */
+        case 6:  /* QImage::Format_ARGB32_Premultiplied */
+        case 16: /* QImage::Format_RGBX8888 */
+        case 17: /* QImage::Format_RGBA8888 */
+        case 18: /* QImage::Format_RGBA8888_Premultiplied */
+            return 4;
+        case 13: /* QImage::Format_RGB888 */
+        case 29: /* QImage::Format_BGR888 */
+            return 3;
+        default:
+            return 0;
+    }
+}
+
+static uint8_t unpremultiply_channel(uint8_t color, uint8_t alpha) {
+    if (alpha == 0 || alpha == 255) {
+        return color;
+    }
+    unsigned value = ((unsigned)color * 255u + alpha / 2u) / alpha;
+    return (uint8_t)(value > 255u ? 255u : value);
+}
+
+static void convert_qimage_row_to_rgba(uint8_t *dst, const uint8_t *src,
+                                       uint32_t width, uint32_t format) {
+    for (uint32_t x = 0; x < width; x++) {
+        uint8_t r;
+        uint8_t g;
+        uint8_t b;
+        uint8_t a = 255;
+
+        switch (format) {
+            case 4: /* QImage::Format_RGB32: native-endian 0xffRRGGBB */
+                b = src[0];
+                g = src[1];
+                r = src[2];
+                src += 4;
+                break;
+            case 5: /* QImage::Format_ARGB32: native-endian 0xAARRGGBB */
+            case 6: /* QImage::Format_ARGB32_Premultiplied */
+                b = src[0];
+                g = src[1];
+                r = src[2];
+                a = src[3];
+                src += 4;
+                if (format == 6) {
+                    r = unpremultiply_channel(r, a);
+                    g = unpremultiply_channel(g, a);
+                    b = unpremultiply_channel(b, a);
+                }
+                break;
+            case 16: /* QImage::Format_RGBX8888: byte-ordered RGBX */
+                r = src[0];
+                g = src[1];
+                b = src[2];
+                src += 4;
+                break;
+            case 17: /* QImage::Format_RGBA8888: byte-ordered RGBA */
+            case 18: /* QImage::Format_RGBA8888_Premultiplied */
+                r = src[0];
+                g = src[1];
+                b = src[2];
+                a = src[3];
+                src += 4;
+                if (format == 18) {
+                    r = unpremultiply_channel(r, a);
+                    g = unpremultiply_channel(g, a);
+                    b = unpremultiply_channel(b, a);
+                }
+                break;
+            case 13: /* QImage::Format_RGB888 */
+                r = src[0];
+                g = src[1];
+                b = src[2];
+                src += 3;
+                break;
+            case 29: /* QImage::Format_BGR888 */
+                b = src[0];
+                g = src[1];
+                r = src[2];
+                src += 3;
+                break;
+            default:
+                return;
+        }
+
+        *dst++ = r;
+        *dst++ = g;
+        *dst++ = b;
+        *dst++ = a;
+    }
+}
+
+static ssize_t read_exact_with_timeout(int fd, void *buffer, size_t size, int timeout_ms) {
+    uint8_t *dst = buffer;
+    size_t total = 0;
+    double deadline = get_time_ms() + timeout_ms;
+
+    while (total < size) {
+        ssize_t n = read(fd, dst + total, size - total);
+        if (n > 0) {
+            total += (size_t)n;
+            continue;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            return -1;
+        }
+
+        int remaining_ms = (int)(deadline - get_time_ms());
+        if (remaining_ms <= 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+
+        struct pollfd pfd = {
+            .fd = fd,
+            .events = POLLIN
+        };
+        int ready = poll(&pfd, 1, remaining_ms);
+        if (ready == 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (pfd.revents & (POLLERR | POLLNVAL)) {
+            errno = EIO;
+            return -1;
         }
     }
 
-    uLongf dest_len = compressBound(raw_size);
-    uint8_t *idat_buf = malloc(dest_len + 4);
-    if (!idat_buf) {
-        free(raw_buf);
-        fclose(f);
-        return -1;
+    return (ssize_t)total;
+}
+
+static bool write_png_from_qimage_pipe(const char *filename, int input_fd,
+                                       const capture_metadata_t *meta) {
+    const int bytes_per_pixel = qimage_bytes_per_pixel(meta->format);
+    if (bytes_per_pixel == 0 ||
+        meta->width == 0 || meta->height == 0 ||
+        meta->width > 32768 || meta->height > 32768 ||
+        meta->stride < meta->width * (uint32_t)bytes_per_pixel ||
+        meta->stride > 512u * 1024u * 1024u) {
+        errno = EINVAL;
+        return false;
     }
-    memcpy(idat_buf, "IDAT", 4);
+
+    if (meta->height > SIZE_MAX / meta->stride) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    const size_t raw_size = (size_t)meta->stride * meta->height;
+    uint8_t *raw_pixels = mmap(NULL, raw_size, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw_pixels == MAP_FAILED) {
+        return false;
+    }
+
+    /*
+     * Drain KWin's non-blocking pipe before doing CPU-heavy PNG work. KWin's
+     * writer can otherwise hit pipe backpressure and terminate with a short
+     * frame while compression is in progress.
+     */
+    if (read_exact_with_timeout(input_fd, raw_pixels, raw_size,
+                                CAPTURE_TIMEOUT_MS) < 0) {
+        munmap(raw_pixels, raw_size);
+        return false;
+    }
+
+    int output_fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (output_fd < 0) {
+        munmap(raw_pixels, raw_size);
+        return false;
+    }
+    FILE *f = fdopen(output_fd, "wb");
+    if (!f) {
+        close(output_fd);
+        munmap(raw_pixels, raw_size);
+        return false;
+    }
+
+    const size_t rgba_row_size = (size_t)meta->width * 4;
+    uint8_t *filtered_row = malloc(rgba_row_size + 1);
+    uint8_t *output_chunk = malloc(PNG_OUTPUT_CHUNK_SIZE);
+    bool ok = filtered_row && output_chunk;
 
     z_stream strm;
     memset(&strm, 0, sizeof(strm));
-    deflateInit(&strm, Z_BEST_SPEED);
-    strm.next_in = raw_buf;
-    strm.avail_in = raw_size;
-    strm.next_out = idat_buf + 4;
-    strm.avail_out = dest_len;
-    deflate(&strm, Z_FINISH);
-    size_t comp_len = strm.total_out;
-    deflateEnd(&strm);
+    bool zlib_initialized = false;
 
-    uint32_t idat_len_be = bswap32(comp_len);
-    fwrite(&idat_len_be, 1, 4, f);
-    fwrite(idat_buf, 1, comp_len + 4, f);
-    uint32_t idat_crc = bswap32(crc32(0, idat_buf, comp_len + 4));
-    fwrite(&idat_crc, 1, 4, f);
+    const uint8_t signature[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    uint8_t ihdr[13] = {
+        (uint8_t)(meta->width >> 24),
+        (uint8_t)(meta->width >> 16),
+        (uint8_t)(meta->width >> 8),
+        (uint8_t)meta->width,
+        (uint8_t)(meta->height >> 24),
+        (uint8_t)(meta->height >> 16),
+        (uint8_t)(meta->height >> 8),
+        (uint8_t)meta->height,
+        8, 6, 0, 0, 0
+    };
 
-    uint32_t iend_len = 0;
-    fwrite(&iend_len, 1, 4, f);
-    uint8_t iend[4] = {'I', 'E', 'N', 'D'};
-    fwrite(iend, 1, 4, f);
-    uint32_t iend_crc = bswap32(crc32(0, iend, 4));
-    fwrite(&iend_crc, 1, 4, f);
+    if (ok) {
+        ok = write_all(f, signature, sizeof(signature)) &&
+             write_png_chunk(f, "IHDR", ihdr, sizeof(ihdr));
+    }
+    if (ok) {
+        int zret = deflateInit2(&strm, Z_BEST_SPEED, Z_DEFLATED, 15, 8, Z_RLE);
+        ok = (zret == Z_OK);
+        zlib_initialized = ok;
+    }
 
-    free(raw_buf);
-    free(idat_buf);
-    fclose(f);
-    return 0;
-}
+    for (uint32_t y = 0; ok && y < meta->height; y++) {
+        filtered_row[0] = 1; /* PNG Sub filter. */
+        convert_qimage_row_to_rgba(filtered_row + 1,
+                                   raw_pixels + (size_t)y * meta->stride,
+                                   meta->width, meta->format);
+        for (size_t i = rgba_row_size; i-- > 4;) {
+            filtered_row[i + 1] =
+                (uint8_t)(filtered_row[i + 1] - filtered_row[i + 1 - 4]);
+        }
 
-/* Detect physical monitor native dimensions (e.g. 1920x1080) to eliminate fractional scaling blur */
-static void get_native_screen_resolution(uint32_t *width, uint32_t *height) {
-    *width = 1920;
-    *height = 1080;
-
-    int drm_fd = open("/dev/dri/card1", O_RDONLY | O_CLOEXEC);
-    if (drm_fd < 0) drm_fd = open("/dev/dri/card0", O_RDONLY | O_CLOEXEC);
-    if (drm_fd >= 0) {
-        struct drm_mode_card_res res;
-        memset(&res, 0, sizeof(res));
-        uint32_t crtc_ids[32];
-        res.count_crtcs = 32;
-        res.crtc_id_ptr = (uint64_t)(uintptr_t)crtc_ids;
-
-        if (ioctl(drm_fd, DRM_IOCTL_MODE_GETRESOURCES, &res) == 0) {
-            for (uint32_t i = 0; i < res.count_crtcs; i++) {
-                struct drm_mode_crtc crtc;
-                memset(&crtc, 0, sizeof(crtc));
-                crtc.crtc_id = crtc_ids[i];
-                if (ioctl(drm_fd, DRM_IOCTL_MODE_GETCRTC, &crtc) == 0 && crtc.mode_valid && crtc.fb_id != 0) {
-                    if (crtc.mode.hdisplay > 0 && crtc.mode.vdisplay > 0) {
-                        *width = crtc.mode.hdisplay;
-                        *height = crtc.mode.vdisplay;
-                        break;
-                    }
-                }
+        strm.next_in = filtered_row;
+        strm.avail_in = (uInt)(rgba_row_size + 1);
+        while (ok && strm.avail_in > 0) {
+            strm.next_out = output_chunk;
+            strm.avail_out = PNG_OUTPUT_CHUNK_SIZE;
+            int zret = deflate(&strm, Z_NO_FLUSH);
+            if (zret != Z_OK) {
+                ok = false;
+                break;
+            }
+            uint32_t produced = PNG_OUTPUT_CHUNK_SIZE - strm.avail_out;
+            if (produced > 0) {
+                ok = write_png_chunk(f, "IDAT", output_chunk, produced);
             }
         }
-        close(drm_fd);
     }
+
+    while (ok) {
+        strm.next_out = output_chunk;
+        strm.avail_out = PNG_OUTPUT_CHUNK_SIZE;
+        int zret = deflate(&strm, Z_FINISH);
+        uint32_t produced = PNG_OUTPUT_CHUNK_SIZE - strm.avail_out;
+        if (produced > 0) {
+            ok = write_png_chunk(f, "IDAT", output_chunk, produced);
+        }
+        if (!ok || zret == Z_STREAM_END) {
+            break;
+        }
+        if (zret != Z_OK) {
+            ok = false;
+            break;
+        }
+    }
+
+    if (ok) {
+        ok = write_png_chunk(f, "IEND", NULL, 0);
+    }
+
+    if (zlib_initialized) {
+        deflateEnd(&strm);
+    }
+    munmap(raw_pixels, raw_size);
+    free(filtered_row);
+    free(output_chunk);
+
+    if (fclose(f) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        unlink(filename);
+    }
+    return ok;
 }
 
-/* Ultra-Fast Direct KWin D-Bus Capture Engine (100% Native Pixel-Perfect Resolution) */
-static bool capture_kwin_direct_dbus(void) {
-    if (!g_user_bus) {
-        if (sd_bus_open_user(&g_user_bus) < 0) return false;
-    }
+static bool append_bool_option(sd_bus_message *message, const char *key, int value) {
+    return sd_bus_message_open_container(message, 'e', "sv") >= 0 &&
+           sd_bus_message_append(message, "s", key) >= 0 &&
+           sd_bus_message_open_container(message, 'v', "b") >= 0 &&
+           sd_bus_message_append(message, "b", value) >= 0 &&
+           sd_bus_message_close_container(message) >= 0 &&
+           sd_bus_message_close_container(message) >= 0;
+}
 
-    int mem_fd = memfd_create("kwin_zeroprint_memfd", MFD_CLOEXEC);
-    if (mem_fd < 0) return false;
+static bool read_capture_metadata(sd_bus_message *reply, capture_metadata_t *meta) {
+    bool raw_type = false;
+    memset(meta, 0, sizeof(*meta));
+    meta->scale = 1.0;
 
-    // Pre-allocate 32MB buffer in RAM
-    if (ftruncate(mem_fd, 3840 * 2160 * 4) < 0) {
-        close(mem_fd);
+    if (sd_bus_message_enter_container(reply, 'a', "{sv}") < 0) {
         return false;
     }
 
-    uint32_t native_w = 1920, native_h = 1080;
-    get_native_screen_resolution(&native_w, &native_h);
+    while (sd_bus_message_enter_container(reply, 'e', "sv") > 0) {
+        const char *key = NULL;
+        char container_type = 0;
+        const char *signature = NULL;
+
+        if (sd_bus_message_read_basic(reply, 's', &key) < 0 ||
+            sd_bus_message_peek_type(reply, &container_type, &signature) < 0 ||
+            container_type != 'v' || !signature ||
+            sd_bus_message_enter_container(reply, 'v', signature) < 0) {
+            return false;
+        }
+
+        if (strcmp(key, "type") == 0 && signature[0] == 's') {
+            const char *value = NULL;
+            if (sd_bus_message_read_basic(reply, 's', &value) >= 0) {
+                raw_type = value && strcmp(value, "raw") == 0;
+            }
+        } else if ((strcmp(key, "width") == 0 ||
+                    strcmp(key, "height") == 0 ||
+                    strcmp(key, "stride") == 0 ||
+                    strcmp(key, "format") == 0) &&
+                   (signature[0] == 'u' || signature[0] == 'i')) {
+            uint32_t value = 0;
+            if (signature[0] == 'u') {
+                sd_bus_message_read_basic(reply, 'u', &value);
+            } else {
+                int32_t signed_value = 0;
+                sd_bus_message_read_basic(reply, 'i', &signed_value);
+                if (signed_value > 0) {
+                    value = (uint32_t)signed_value;
+                }
+            }
+            if (strcmp(key, "width") == 0) meta->width = value;
+            else if (strcmp(key, "height") == 0) meta->height = value;
+            else if (strcmp(key, "stride") == 0) meta->stride = value;
+            else meta->format = value;
+        } else if (strcmp(key, "scale") == 0 && signature[0] == 'd') {
+            sd_bus_message_read_basic(reply, 'd', &meta->scale);
+        } else {
+            sd_bus_message_skip(reply, signature);
+        }
+
+        if (sd_bus_message_exit_container(reply) < 0 ||
+            sd_bus_message_exit_container(reply) < 0) {
+            return false;
+        }
+    }
+
+    if (sd_bus_message_exit_container(reply) < 0) {
+        return false;
+    }
+
+    const int bytes_per_pixel = qimage_bytes_per_pixel(meta->format);
+    return raw_type &&
+           bytes_per_pixel > 0 &&
+           meta->width > 0 && meta->height > 0 &&
+           meta->stride >= meta->width * (uint32_t)bytes_per_pixel &&
+           meta->scale > 0.0;
+}
+
+/*
+ * KWin ScreenShot2 uses logical compositor coordinates. Requesting the DRM
+ * mode as a CaptureArea therefore over-captures at fractional scale. The
+ * native-resolution option is the supported way to ask KWin to render the
+ * complete workspace at compositor-native resolution.
+ */
+static bool capture_kwin_direct_dbus(void) {
+    if (!g_user_bus && sd_bus_open_user(&g_user_bus) < 0) {
+        return false;
+    }
+
+    int pipe_fds[2] = {-1, -1};
+    if (pipe2(pipe_fds, O_CLOEXEC) < 0) {
+        return false;
+    }
+    int read_flags = fcntl(pipe_fds[0], F_GETFL, 0);
+    if (read_flags < 0 ||
+        fcntl(pipe_fds[0], F_SETFL, read_flags | O_NONBLOCK) < 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        return false;
+    }
 
     sd_bus_error error = SD_BUS_ERROR_NULL;
-    sd_bus_message *m = NULL;
+    sd_bus_message *message = NULL;
     sd_bus_message *reply = NULL;
-    int r;
-
-    // Use CaptureArea with native physical pixel dimensions to guarantee 1:1 pixel crispness
-    r = sd_bus_message_new_method_call(g_user_bus, &m,
-                                       "org.kde.KWin",
-                                       "/org/kde/KWin/ScreenShot2",
-                                       "org.kde.KWin.ScreenShot2",
-                                       "CaptureArea");
-    if (r < 0) {
-        close(mem_fd);
-        return false;
-    }
-
-    sd_bus_message_append(m, "iiuu", 0, 0, native_w, native_h);
-    sd_bus_message_open_container(m, 'a', "{sv}");
-    sd_bus_message_close_container(m);
-    sd_bus_message_append(m, "h", mem_fd);
-
-    r = sd_bus_call(g_user_bus, m, 2000000, &error, &reply);
-    if (r < 0) {
-        sd_bus_error_free(&error);
-        sd_bus_message_unref(m);
-        close(mem_fd);
-        return false;
-    }
-
-    uint32_t width = 1920, height = 1080;
-    r = sd_bus_message_enter_container(reply, 'a', "{sv}");
-    if (r >= 0) {
-        while (sd_bus_message_enter_container(reply, 'e', "sv") > 0) {
-            const char *key;
-            char type;
-            const char *contents;
-            sd_bus_message_read_basic(reply, 's', &key);
-            sd_bus_message_peek_type(reply, &type, &contents);
-            if (strcmp(key, "width") == 0) {
-                sd_bus_message_enter_container(reply, 'v', NULL);
-                if (contents && contents[0] == 'i') {
-                    int v; sd_bus_message_read_basic(reply, 'i', &v); width = v;
-                } else if (contents && contents[0] == 'u') {
-                    uint32_t v; sd_bus_message_read_basic(reply, 'u', &v); width = v;
-                }
-                sd_bus_message_exit_container(reply);
-            } else if (strcmp(key, "height") == 0) {
-                sd_bus_message_enter_container(reply, 'v', NULL);
-                if (contents && contents[0] == 'i') {
-                    int v; sd_bus_message_read_basic(reply, 'i', &v); height = v;
-                } else if (contents && contents[0] == 'u') {
-                    uint32_t v; sd_bus_message_read_basic(reply, 'u', &v); height = v;
-                }
-                sd_bus_message_exit_container(reply);
-            } else {
-                sd_bus_message_skip(reply, "v");
-            }
-            sd_bus_message_exit_container(reply);
-        }
-        sd_bus_message_exit_container(reply);
-    }
-
-    size_t img_size = (size_t)width * height * 4;
-    void *pixels = mmap(NULL, img_size, PROT_READ, MAP_SHARED, mem_fd, 0);
+    capture_metadata_t meta;
+    char temp_path[128];
     bool ok = false;
-    if (pixels != MAP_FAILED) {
-        ok = (write_png_rgba(SHM_PATH, (const uint8_t *)pixels, width, height) == 0);
-        munmap(pixels, img_size);
+    make_temp_path(temp_path, sizeof(temp_path));
+
+    int r = sd_bus_message_new_method_call(g_user_bus, &message,
+                                           "org.kde.KWin",
+                                           "/org/kde/KWin/ScreenShot2",
+                                           "org.kde.KWin.ScreenShot2",
+                                           "CaptureWorkspace");
+    if (r < 0 ||
+        sd_bus_message_open_container(message, 'a', "{sv}") < 0 ||
+        !append_bool_option(message, "native-resolution", 1) ||
+        sd_bus_message_close_container(message) < 0 ||
+        sd_bus_message_append(message, "h", pipe_fds[1]) < 0) {
+        goto cleanup;
     }
 
-    sd_bus_error_free(&error);
-    sd_bus_message_unref(m);
+    r = sd_bus_call(g_user_bus, message, 2000000, &error, &reply);
+    close(pipe_fds[1]);
+    pipe_fds[1] = -1;
+    if (r < 0 || !read_capture_metadata(reply, &meta)) {
+        goto cleanup;
+    }
+    /*
+     * sd-bus keeps a duplicated copy of the passed descriptor in the
+     * outgoing message. Release it before draining the pipe so EOF reflects
+     * only KWin's writer.
+     */
+    sd_bus_message_unref(message);
+    message = NULL;
     sd_bus_message_unref(reply);
-    close(mem_fd);
+    reply = NULL;
 
+    unlink(temp_path);
+    if (!write_png_from_qimage_pipe(temp_path, pipe_fds[0], &meta)) {
+        goto cleanup;
+    }
+    if (rename(temp_path, SHM_PATH) < 0) {
+        unlink(temp_path);
+        goto cleanup;
+    }
+
+    g_last_capture = meta;
+    ok = true;
+
+cleanup:
+    if (!ok) unlink(temp_path);
+    if (pipe_fds[0] >= 0) close(pipe_fds[0]);
+    if (pipe_fds[1] >= 0) close(pipe_fds[1]);
+    sd_bus_error_free(&error);
+    sd_bus_message_unref(message);
+    sd_bus_message_unref(reply);
     return ok;
 }
 
@@ -329,16 +603,47 @@ static compositor_backend_t detect_backend(void) {
     return BACKEND_KDE;
 }
 
+static bool is_valid_png_file(const char *path) {
+    static const uint8_t expected[8] =
+        {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    uint8_t header[24];
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+
+    ssize_t count = read(fd, header, sizeof(header));
+    close(fd);
+    if (count != (ssize_t)sizeof(header) ||
+        memcmp(header, expected, sizeof(expected)) != 0 ||
+        memcmp(header + 12, "IHDR", 4) != 0) {
+        return false;
+    }
+
+    uint32_t width = ((uint32_t)header[16] << 24) |
+                     ((uint32_t)header[17] << 16) |
+                     ((uint32_t)header[18] << 8) |
+                     (uint32_t)header[19];
+    uint32_t height = ((uint32_t)header[20] << 24) |
+                      ((uint32_t)header[21] << 16) |
+                      ((uint32_t)header[22] << 8) |
+                      (uint32_t)header[23];
+    return width > 0 && height > 0;
+}
+
 static void execute_capture_and_pipe(void) {
     bool captured = false;
+    char temp_path[128];
+    make_temp_path(temp_path, sizeof(temp_path));
 
-    // 1. On KDE: Attempt ultra-fast direct KWin D-Bus capture first (~9ms)
+    /* Prefer the direct KWin raw-frame path on KDE. */
     if (g_backend == BACKEND_KDE) {
         captured = capture_kwin_direct_dbus();
     }
 
-    // 2. Fallback to native compositor CLI if direct D-Bus is unavailable
+    /* Fall back to the compositor's CLI and publish only a complete PNG. */
     if (!captured) {
+        unlink(temp_path);
         int ret = -1;
         switch (g_backend) {
             case BACKEND_KDE: {
@@ -350,7 +655,7 @@ static void execute_capture_and_pipe(void) {
                         dup2(devnull, STDOUT_FILENO);
                         close(devnull);
                     }
-                    char *args[] = {"spectacle", "-b", "-f", "-n", "-o", SHM_PATH, NULL};
+                    char *args[] = {"spectacle", "-b", "-f", "-n", "-o", temp_path, NULL};
                     execvp("spectacle", args);
                     _exit(127);
                 } else if (pid > 0) {
@@ -373,7 +678,7 @@ static void execute_capture_and_pipe(void) {
                                     "--dest", "org.gnome.Shell.Screenshot",
                                     "--object-path", "/org/gnome/Shell/Screenshot",
                                     "--method", "org.gnome.Shell.Screenshot.Screenshot",
-                                    "true", "false", SHM_PATH, NULL};
+                                    "true", "false", temp_path, NULL};
                     execvp("gdbus", args);
                     _exit(127);
                 } else if (pid > 0) {
@@ -393,7 +698,7 @@ static void execute_capture_and_pipe(void) {
                         dup2(devnull, STDOUT_FILENO);
                         close(devnull);
                     }
-                    char *args[] = {"grim", SHM_PATH, NULL};
+                    char *args[] = {"grim", temp_path, NULL};
                     execvp("grim", args);
                     _exit(127);
                 } else if (pid > 0) {
@@ -404,10 +709,14 @@ static void execute_capture_and_pipe(void) {
                 break;
             }
         }
-        if (ret != 0) return;
+        if (ret != 0 || !is_valid_png_file(temp_path) ||
+            rename(temp_path, SHM_PATH) < 0) {
+            unlink(temp_path);
+            return;
+        }
     }
 
-    // 3. Stream captured PNG directly into wl-copy clipboard asynchronously
+    /* Stream the atomically published PNG into the clipboard. */
     int fd = open(SHM_PATH, O_RDONLY | O_CLOEXEC);
     if (fd >= 0) {
         pid_t copy_pid = fork();
@@ -502,28 +811,52 @@ static void handle_inotify_events(void) {
     }
 }
 
+static int compare_doubles(const void *left, const void *right) {
+    const double a = *(const double *)left;
+    const double b = *(const double *)right;
+    return (a > b) - (a < b);
+}
+
 static void run_benchmark(void) {
+    enum { SAMPLE_COUNT = 5 };
+
     printf("===================================================================\n");
-    printf("     WAYLAND-ZEROPRINT V%s HARDWARE LATENCY BENCHMARK             \n", VERSION);
+    printf("       WAYLAND-ZEROPRINT V%s CAPTURE BENCHMARK                    \n", VERSION);
     printf("===================================================================\n");
 
     double t0 = get_time_us();
     double t1 = get_time_us();
-    printf("  ⏱️  1. Monotonic Clock Resolution  : %6.2f µs (Precision)\n", t1 - t0);
+    printf("  Clock read overhead sample : %.2f µs\n", t1 - t0);
 
     if (g_backend == BACKEND_KDE) {
-        double d0 = get_time_us();
-        bool ok = capture_kwin_direct_dbus();
-        double d1 = get_time_us();
-        if (ok) {
-            printf("  ⏱️  2. Direct KWin D-Bus Capture   : %6.2f ms (%.2f µs) [ACTIVE]\n",
-                   (d1 - d0) / 1000.0, d1 - d0);
+        double samples[SAMPLE_COUNT];
+        size_t completed = 0;
+        for (size_t i = 0; i < SAMPLE_COUNT; i++) {
+            double start = get_time_us();
+            bool ok = capture_kwin_direct_dbus();
+            double end = get_time_us();
+            if (!ok) {
+                break;
+            }
+            samples[completed++] = (end - start) / 1000.0;
+        }
+
+        if (completed == SAMPLE_COUNT) {
+            qsort(samples, SAMPLE_COUNT, sizeof(samples[0]), compare_doubles);
+            printf("  KWin native capture + PNG : min %.2f / median %.2f / max %.2f ms (%d runs)\n",
+                   samples[0], samples[SAMPLE_COUNT / 2],
+                   samples[SAMPLE_COUNT - 1], SAMPLE_COUNT);
+            printf("  Captured frame            : %ux%u, scale %.2f, stride %u, QImage format %u\n",
+                   g_last_capture.width, g_last_capture.height,
+                   g_last_capture.scale, g_last_capture.stride,
+                   g_last_capture.format);
         } else {
-            printf("  ⏱️  2. Direct KWin D-Bus Capture   : [Needs KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1]\n");
+            printf("  KWin native capture       : failed after %zu/%d runs\n",
+                   completed, SAMPLE_COUNT);
         }
     }
 
-    printf("  🖥️  Detected Compositor Backend  : %s\n",
+    printf("  Detected compositor       : %s\n",
            (g_backend == BACKEND_KDE) ? "KDE Plasma 6 (Direct D-Bus + Spectacle Fallback)" :
            (g_backend == BACKEND_GNOME) ? "GNOME Shell (gdbus)" : "wlroots (grim)");
     printf("===================================================================\n");
@@ -615,7 +948,7 @@ int main(int argc, char **argv) {
                     continue;
                 }
 
-                size_t count = bytes / sizeof(struct input_event);
+                size_t count = (size_t)bytes / sizeof(struct input_event);
                 for (size_t k = 0; k < count; k++) {
                     if (ev_buf[k].type == EV_KEY &&
                         (ev_buf[k].code == KEY_SYSRQ || ev_buf[k].code == KEY_PRINT) &&
