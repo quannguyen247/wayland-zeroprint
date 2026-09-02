@@ -20,6 +20,7 @@ systemctl --user daemon-reload
 
 # Remove binary
 rm -f "$HOME/.local/bin/wayland-zeroprint"
+echo -e "${YELLOW}[INFO]${NC} Preserved user config: $HOME/.config/wayland-zeroprint/config"
 
 # Remove udev rule
 if [ -f "/etc/udev/rules.d/99-wayland-zeroprint.rules" ]; then
@@ -28,4 +29,4 @@ if [ -f "/etc/udev/rules.d/99-wayland-zeroprint.rules" ]; then
     sudo udevadm control --reload-rules
 fi
 
-echo -e "${GREEN}[OK]${NC} wayland-zeroprint has been completely uninstalled."
+echo -e "${GREEN}[OK]${NC} wayland-zeroprint was removed; your user config was preserved."
