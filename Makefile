@@ -58,7 +58,8 @@ install-user: install-bin install-config install-kwin-env
 	install -d $(SYSTEMD_USER_DIR)
 	install -m 644 systemd/wayland-zeroprint.service $(SYSTEMD_USER_DIR)/wayland-zeroprint.service
 	systemctl --user daemon-reload
-	systemctl --user enable --now wayland-zeroprint.service
+	systemctl --user enable wayland-zeroprint.service
+	systemctl --user restart wayland-zeroprint.service
 
 install-udev:
 	sudo install -d $(UDEV_DIR)

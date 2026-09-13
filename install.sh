@@ -82,7 +82,8 @@ fi
 mkdir -p "$HOME/.config/systemd/user"
 cp -f systemd/wayland-zeroprint.service "$HOME/.config/systemd/user/wayland-zeroprint.service"
 systemctl --user daemon-reload
-systemctl --user restart wayland-zeroprint.service || systemctl --user enable --now wayland-zeroprint.service
+systemctl --user enable wayland-zeroprint.service
+systemctl --user restart wayland-zeroprint.service
 
 echo -e "${GREEN}[SUCCESS]${NC} wayland-zeroprint (Direct KWin Engine) is installed and active!"
 echo -e "${BLUE}==>${NC} Try it out: press PrintScreen and immediately paste (Ctrl+V) anywhere."

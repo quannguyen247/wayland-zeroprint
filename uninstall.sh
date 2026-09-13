@@ -20,6 +20,7 @@ systemctl --user daemon-reload
 
 # Remove binary
 rm -f "$HOME/.local/bin/wayland-zeroprint"
+rm -f "$HOME/.config/environment.d/10-kwin-screenshot.conf"
 echo -e "${YELLOW}[INFO]${NC} Preserved user config: $HOME/.config/wayland-zeroprint/config"
 
 # Remove udev rule
