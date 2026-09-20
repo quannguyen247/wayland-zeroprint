@@ -1,5 +1,3 @@
-# Grant active local desktop seat read access to evdev input events
-KERNEL=="event*", SUBSYSTEM=="input", TAG+="uaccess"
-
-# Fallback permissions for non-systemd environments or input group members
+# The daemon reads evdev through the input group. Do not grant a seat-wide ACL:
+# other programs in the desktop session would gain the same raw input access.
 KERNEL=="event*", SUBSYSTEM=="input", GROUP="input", MODE="0660"

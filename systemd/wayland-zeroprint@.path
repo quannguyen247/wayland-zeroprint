@@ -1,0 +1,9 @@
+[Unit]
+Description=Start wayland-zeroprint when user UID %i enters Wayland
+
+[Path]
+PathExists=/run/user/%i/wayland-0
+Unit=wayland-zeroprint@%i.service
+
+[Install]
+WantedBy=multi-user.target

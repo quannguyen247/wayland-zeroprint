@@ -179,9 +179,23 @@ On modern Linux Wayland desktop environments (**KDE Plasma 6**, **GNOME Shell**,
 ### Method 2: Makefile
 
 ```bash
-# Build native binary, install systemd user service, and configure udev rules
+# Build the binary, install the isolated system service, and configure udev
 make install
 ```
+
+The installer does not grant raw input access to the desktop session. Event
+nodes remain `root:input 0660`, without a blanket `uaccess` ACL. A templated
+system service runs the daemon under the login UID and adds `input` only to
+that process. Its device cgroup permits read-only access to the kernel input
+major and denies raw USB and `hidraw` devices.
+
+Installation stops if the login account belongs to `input` or the current
+session still carries that group from an earlier login. Either case lets
+unrelated processes read evdev. The installer does not remove an existing
+membership because other tools may rely on it. Review those tools and move any
+necessary raw-device access to narrowly scoped services before removing the
+account from `input` yourself. Then log out and back in before rerunning the
+installer; an existing session retains its inherited groups.
 
 ---
 
@@ -280,14 +294,15 @@ On GNOME and wlroots compositors the evdev trigger remains passive, so any deskt
 
 ## Verification & Status
 
-Check the status of the background user service:
+Check the status of the isolated service (replace `$(id -u)` only when checking
+another login account):
 ```bash
-systemctl --user status wayland-zeroprint.service
+systemctl status "wayland-zeroprint@$(id -u).service"
 ```
 
-Verify that it is enabled across system reboots:
+Verify that its Wayland-session path unit is enabled across reboots:
 ```bash
-systemctl --user is-enabled wayland-zeroprint.service
+systemctl is-enabled "wayland-zeroprint@$(id -u).path"
 ```
 
 ---
@@ -309,7 +324,8 @@ make uninstall
 
 * **In-Memory Volatility by default**: With `output_mode=clipboard`, captures reside exclusively in `/dev/shm` (Linux tmpfs physical RAM) and vanish across reboot. `file` and `both` are explicit persistence opt-ins and write to `save_path`.
 * **Atomic Overwriting Buffer**: Successive screenshot triggers atomically overwrite `/dev/shm/wayland_zeroprint.png`, preventing historical image buildup or unmonitored disk accumulation.
-* **Least-Privilege Execution**: The background daemon executes entirely within user space under standard user credentials, relying on localized `uaccess` rules for `/dev/input` and standard session D-Bus endpoints.
+* **Process-scoped evdev access**: The daemon keeps the login UID for its home directory, compositor IPC, and output files. Only its systemd service receives the supplementary `input` group. `DevicePolicy=closed` then limits that service to read-only evdev access and standard pseudo devices.
+* **No session-wide raw device grant**: The udev rule keeps `event*` nodes at `root:input 0660` and never adds `uaccess`. Installation refuses an account that belongs to `input` instead of silently changing its group memberships. A fresh login without that group keeps unrelated applications from reading evdev through this rule.
 
 ---
 
