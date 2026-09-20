@@ -1,0 +1,35 @@
+[Unit]
+Description=Zero-Drop Hardware PrintScreen Daemon for user UID %i
+Documentation=https://github.com/quannguyen247/wayland-zeroprint
+BindsTo=user@%i.service
+After=user@%i.service
+
+[Service]
+Type=simple
+User=%i
+SupplementaryGroups=input
+Environment=XDG_RUNTIME_DIR=/run/user/%i
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%i/bus
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=XDG_SESSION_TYPE=wayland
+ExecStartPre=/usr/bin/test -S /run/user/%i/bus
+ExecStart=/usr/local/bin/wayland-zeroprint
+Restart=on-failure
+RestartSec=2
+
+# The daemon receives evdev access without adding input to the login account.
+# The installer checks that the account is not already a member of input.
+# The service cannot open raw USB or hidraw devices.
+DevicePolicy=closed
+DeviceAllow=char-input r
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+LockPersonality=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes

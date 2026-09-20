@@ -1,0 +1,16 @@
+[Unit]
+Description=Start wayland-zeroprint when user UID %i enters Wayland
+# Watch the mounted runtime directory, not the directory underneath it at boot.
+# The default Before=paths.target would conflict with After=user@%i.service.
+DefaultDependencies=no
+BindsTo=user@%i.service
+After=user@%i.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Path]
+PathExists=/run/user/%i/wayland-0
+Unit=wayland-zeroprint@%i.service
+
+[Install]
+WantedBy=user@%i.service
