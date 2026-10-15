@@ -311,6 +311,24 @@ Verify that its Wayland-session path unit is enabled across reboots:
 systemctl is-enabled "wayland-zeroprint@$(id -u).path"
 ```
 
+The path unit watches numbered Wayland sockets (`wayland-0`, `wayland-1`,
+`wayland-10`, etc.), excluding `.lock` files. The system service reads
+`WAYLAND_DISPLAY` from the user's systemd manager instead of assuming display
+zero. If the login environment has not been imported yet, it reports that
+condition and systemd retries. A manually launched process keeps its explicit
+`WAYLAND_DISPLAY`. In both cases the selected path must be a socket owned by
+the login UID; the daemon never guesses between sockets from concurrent sessions.
+
+To inspect this selection without reading input or changing the clipboard:
+
+```bash
+env -u WAYLAND_DISPLAY wayland-zeroprint --print-wayland-display
+```
+
+For a compositor using a custom socket name, start the service explicitly after
+exporting its `WAYLAND_DISPLAY` to the user manager; automatic activation covers
+the standard numbered names.
+
 ---
 
 ## Uninstallation

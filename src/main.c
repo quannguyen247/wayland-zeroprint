@@ -156,6 +156,73 @@ static double get_time_us(void) {
     return (double)ts.tv_sec * 1000000.0 + (double)ts.tv_nsec / 1000.0;
 }
 
+/* A system service does not inherit the compositor's environment. Resolve the
+ * display from the user's manager, which startplasma imports during login.
+ * Never guess the first socket: the same UID can have multiple compositors. */
+static bool prepare_wayland_environment(void) {
+    const char *display = getenv("WAYLAND_DISPLAY");
+    sd_bus *bus = NULL;
+    char **environment = NULL;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    bool ok = false;
+
+    if (!display || !*display) {
+        int r = sd_bus_open_user(&bus);
+        if (r >= 0) r = sd_bus_set_method_call_timeout(bus, 2000000);
+        if (r >= 0) {
+            r = sd_bus_get_property_strv(bus, "org.freedesktop.systemd1",
+                    "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
+                    "Environment", &error, &environment);
+        }
+        if (r < 0) {
+            fprintf(stderr, "wayland-zeroprint: cannot read session environment: %s\n",
+                    error.message ? error.message : strerror(-r));
+            goto finish;
+        }
+        for (size_t i = 0; environment && environment[i]; i++) {
+            if (!strncmp(environment[i], "WAYLAND_DISPLAY=", 16)) {
+                display = environment[i] + 16;
+                break;
+            }
+        }
+    }
+    if (!display || !*display) {
+        fprintf(stderr, "wayland-zeroprint: session has not exported WAYLAND_DISPLAY yet\n");
+        goto finish;
+    }
+
+    char path[PATH_MAX];
+    int length;
+    if (display[0] == '/') {
+        length = snprintf(path, sizeof(path), "%s", display);
+    } else {
+        const char *runtime = getenv("XDG_RUNTIME_DIR");
+        if (!runtime || runtime[0] != '/') {
+            fprintf(stderr, "wayland-zeroprint: XDG_RUNTIME_DIR must be an absolute path\n");
+            goto finish;
+        }
+        length = snprintf(path, sizeof(path), "%s/%s", runtime, display);
+    }
+    struct stat st;
+    if (length < 0 || (size_t)length >= sizeof(path) ||
+        stat(path, &st) < 0 || !S_ISSOCK(st.st_mode) || st.st_uid != getuid()) {
+        fprintf(stderr, "wayland-zeroprint: WAYLAND_DISPLAY is not a socket owned by this UID: %s\n",
+                display);
+        goto finish;
+    }
+    if (setenv("WAYLAND_DISPLAY", display, 1) < 0) {
+        perror("setenv WAYLAND_DISPLAY");
+        goto finish;
+    }
+    ok = true;
+finish:
+    for (size_t i = 0; environment && environment[i]; i++) free(environment[i]);
+    free(environment);
+    sd_bus_error_free(&error);
+    sd_bus_unref(bus);
+    return ok;
+}
+
 typedef struct {
     const char *name;
     uint16_t evdev_code;
@@ -1935,6 +2002,7 @@ int main(int argc, char **argv) {
     bool want_print_config = false;
     bool want_help = false;
     bool want_self_test = false;
+    bool want_print_wayland_display = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--benchmark") == 0 || strcmp(argv[i], "-b") == 0) {
             want_benchmark = true;
@@ -1946,6 +2014,8 @@ int main(int argc, char **argv) {
             want_print_config = true;
         } else if (strcmp(argv[i], "--self-test") == 0) {
             want_self_test = true;
+        } else if (strcmp(argv[i], "--print-wayland-display") == 0) {
+            want_print_wayland_display = true;
         } else if (strcmp(argv[i], "--config") == 0) {
             i++;
         } else if (strcmp(argv[i], "--trigger") == 0) {
@@ -1990,6 +2060,7 @@ int main(int argc, char **argv) {
         printf("      --save-path P  File path, directory, or strftime template\n");
         printf("      --print-config Validate and show the active configuration\n");
         printf("      --self-test    Run parser and matching unit tests\n");
+        printf("      --print-wayland-display Resolve the session socket without capturing\n");
         printf("  -v, --version      Show version\n");
         printf("  -h, --help         Show this help\n");
         return 0;
@@ -2001,6 +2072,11 @@ int main(int argc, char **argv) {
     if (want_self_test) return run_self_tests();
     if (want_print_config) {
         print_active_config(&g_config, config_path);
+        return 0;
+    }
+    if (!prepare_wayland_environment()) return 1;
+    if (want_print_wayland_display) {
+        puts(getenv("WAYLAND_DISPLAY"));
         return 0;
     }
     if (want_benchmark) {

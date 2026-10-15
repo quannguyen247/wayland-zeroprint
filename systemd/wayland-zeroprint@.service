@@ -10,7 +10,7 @@ User=%i
 SupplementaryGroups=input
 Environment=XDG_RUNTIME_DIR=/run/user/%i
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%i/bus
-Environment=WAYLAND_DISPLAY=wayland-0
+# The daemon reads WAYLAND_DISPLAY from the user's systemd manager.
 Environment=XDG_SESSION_TYPE=wayland
 ExecStartPre=/usr/bin/test -S /run/user/%i/bus
 ExecStart=/usr/local/bin/wayland-zeroprint

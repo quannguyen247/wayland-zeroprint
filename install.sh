@@ -109,9 +109,12 @@ sudo install -m 644 systemd/wayland-zeroprint@.path /etc/systemd/system/wayland-
 sudo systemctl daemon-reload
 sudo systemctl reenable "wayland-zeroprint@${install_uid}.path"
 sudo systemctl restart "wayland-zeroprint@${install_uid}.path"
-if [ -S "/run/user/${install_uid}/wayland-0" ]; then
-    sudo systemctl restart "wayland-zeroprint@${install_uid}.service"
-fi
+for display_socket in /run/user/"${install_uid}"/wayland-*[0-9]; do
+    if [ -S "$display_socket" ]; then
+        sudo systemctl restart "wayland-zeroprint@${install_uid}.service"
+        break
+    fi
+done
 
 echo -e "${GREEN}[SUCCESS]${NC} wayland-zeroprint (Direct KWin Engine) is installed and active!"
 echo -e "${BLUE}==>${NC} Try it out: press PrintScreen and immediately paste (Ctrl+V) anywhere."

@@ -9,7 +9,9 @@ Conflicts=shutdown.target
 Before=shutdown.target
 
 [Path]
-PathExists=/run/user/%i/wayland-0
+# Match numbered compositor sockets, including wayland-1 and wayland-10.
+# Ending in a digit excludes the .lock files created before the socket.
+PathExistsGlob=/run/user/%i/wayland-*[0-9]
 Unit=wayland-zeroprint@%i.service
 
 [Install]

@@ -48,6 +48,7 @@ test: $(TARGET)
 	@tests/test-cli.sh $(TARGET)
 	@tests/test-systemd.sh
 	@tests/test-install-security.sh
+	@tests/test-wayland-environment.py $(TARGET)
 
 install-bin: $(TARGET)
 	sudo install -d /usr/local/bin
@@ -84,9 +85,11 @@ install-service:
 	sudo systemctl daemon-reload
 	sudo systemctl reenable $(PATH_INSTANCE)
 	sudo systemctl restart $(PATH_INSTANCE)
-	@if test -S /run/user/$(INSTALL_UID)/wayland-0; then \
-		sudo systemctl restart $(SERVICE_INSTANCE); \
-	fi
+	@for display_socket in /run/user/$(INSTALL_UID)/wayland-*[0-9]; do \
+		if test -S "$$display_socket"; then \
+			sudo systemctl restart $(SERVICE_INSTANCE); break; \
+		fi; \
+	done
 
 install-udev:
 	sudo install -d $(UDEV_DIR)
